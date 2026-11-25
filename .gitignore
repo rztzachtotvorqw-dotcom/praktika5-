@@ -1,0 +1,6 @@
+/dist/
+/build/
+# Приватный ключ подписи никогда не коммитим — он нужен только Nexus
+*.private.asc
+*.secret.asc
+syspulse-repo.private.asc

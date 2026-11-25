@@ -1,0 +1,334 @@
+name: Build & Publish syspulse .deb to Nexus (APT)
+
+on:
+  push:
+    branches: ["release"]
+  workflow_dispatch:
+
+# Два запуска на одну ветку не публикуют пакет одновременно — второй ждёт первого
+concurrency:
+  group: publish-deb-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.21"
+  PKG: syspulse
+  ARCH: amd64
+  NEXUS_REPO: syspulse        # имя hosted APT-репозитория в Nexus
+  NEXUS_PORT: "8081"
+  APT_DIST: stable            # поле Distribution в настройках репозитория Nexus
+  APT_COMPONENT: main         # Nexus публикует hosted-пакеты в компонент main
+  VERIFY_IMAGE: ubuntu:22.04
+
+jobs:
+  build-publish-verify:
+    runs-on: self-hosted      # self-hosted раннер, зарегистрированный в Практике №3
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── 0. Проверка раннера ────────────────────────────────────────────
+      # Раннер как сервис launchd на macOS не видит Homebrew и Docker Desktop в PATH
+      - name: "0a. macOS: PATH для Homebrew и Docker Desktop"
+        if: runner.os == 'macOS'
+        run: |
+          for d in /opt/homebrew/bin /usr/local/bin /Applications/Docker.app/Contents/Resources/bin; do
+            if [ -d "$d" ]; then echo "$d" >> "$GITHUB_PATH"; fi
+          done
+
+      - name: "0. Preflight: инструменты на раннере"
+        run: |
+          set -euo pipefail
+          OS="$(uname -s)"
+          hint() { [ "${OS}" = "Darwin" ] && echo " (macOS: $1)" || true; }
+          for tool in git curl dpkg-deb docker; do
+            if ! command -v "$tool" >/dev/null; then
+              case "$tool" in
+                dpkg-deb) echo "::error::На раннере нет dpkg-deb$(hint 'brew install dpkg')" ;;
+                docker)   echo "::error::На раннере нет docker$(hint 'установите и запустите Docker Desktop')" ;;
+                *)        echo "::error::На раннере нет '$tool'" ;;
+              esac
+              exit 1
+            fi
+          done
+          command -v sha256sum >/dev/null || command -v shasum >/dev/null \
+            || { echo "::error::Нет ни sha256sum, ни shasum"; exit 1; }
+          if ! docker info >/dev/null 2>&1; then
+            if [ "${OS}" = "Darwin" ]; then
+              echo "::error::Docker не отвечает: запустите Docker Desktop и дождитесь статуса Running"
+            else
+              echo "::error::Пользователь раннера не может обратиться к Docker (добавьте его в группу docker и перезапустите раннер)"
+            fi
+            exit 1
+          fi
+          echo "✅ Раннер: $(uname -sm), $(dpkg-deb --version | head -1)"
+          echo "✅ Docker: $(docker version --format '{{.Server.Os}}/{{.Server.Arch}} {{.Server.Version}}' 2>/dev/null || echo '?')"
+
+      # ── 1. Сборка статического бинарника ───────────────────────────────
+      - name: "1a. Version: версия берётся из main.go"
+        id: ver
+        run: |
+          set -euo pipefail
+          # sed -E вместо grep -P: в BSD grep на macOS нет -P (PCRE)
+          VER=$(sed -nE 's/^const Version = "([0-9][0-9A-Za-z.+~-]*)".*/\1/p' main.go | head -n1)
+          if [ -z "${VER}" ]; then
+            echo "::error::Не удалось извлечь const Version из main.go"
+            exit 1
+          fi
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "📌 Версия пакета (из main.go): ${VER}"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false        # внешних зависимостей нет (нет go.sum), кэшировать нечего
+
+      - name: "1b. Build: статический бинарник linux/amd64"
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          rm -rf dist && mkdir -p dist
+          go build -trimpath -ldflags="-s -w" -o "dist/${PKG}" .
+          ls -lh "dist/${PKG}"
+
+          # Доказательство статической линковки. `file` есть и на macOS, и на Linux;
+          # ldd — только на Linux (и он не умеет читать ELF на macOS).
+          if command -v file >/dev/null; then
+            LINK_INFO=$(file -b "dist/${PKG}")
+          else
+            LINK_INFO=$(ldd "dist/${PKG}" 2>&1 || true)
+          fi
+          echo "file: ${LINK_INFO}"
+          case "${LINK_INFO}" in
+            *"statically linked"*|*"not a dynamic executable"*) echo "✅ Бинарник статический" ;;
+            *) echo "::error::Бинарник слинкован динамически"; exit 1 ;;
+          esac
+
+          # Linux-бинарник можно запустить только на Linux x86_64 (на macOS — нет:
+          # это ELF, а не Mach-O). Полноценная проверка запуска — в шаге Verify.
+          if [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "x86_64" ]; then
+            "./dist/${PKG}" --version
+          fi
+
+      # ── 2. Упаковка в .deb ─────────────────────────────────────────────
+      - name: "2. Package: сборка .deb через dpkg-deb"
+        id: pack
+        env:
+          VER: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Воспроизводимость: все даты внутри .deb = время коммита,
+          # поэтому один и тот же коммит даёт побайтно одинаковый .deb
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          # Эти команды работают и с GNU (Linux), и с BSD (macOS) утилитами
+          sha256_of() {
+            if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1
+          }
+          STAMP=$(TZ=UTC date -r "${SOURCE_DATE_EPOCH}" +%Y%m%d%H%M.%S 2>/dev/null \
+               || TZ=UTC date -d "@${SOURCE_DATE_EPOCH}" +%Y%m%d%H%M.%S)
+
+          ROOT="build/${PKG}_${VER}"
+          DEB="dist/${PKG}_${VER}_${ARCH}.deb"
+          rm -rf build
+          mkdir -p "${ROOT}/DEBIAN" "${ROOT}/usr/bin"
+          install -m 0755 "dist/${PKG}" "${ROOT}/usr/bin/${PKG}"
+          BYTES=$(wc -c < "${ROOT}/usr/bin/${PKG}" | tr -d ' ')
+          INSTALLED_SIZE=$(( (BYTES + 1023) / 1024 ))   # КиБ, с округлением вверх
+
+          cat > "${ROOT}/DEBIAN/control" <<EOF
+          Package: ${PKG}
+          Version: ${VER}
+          Section: utils
+          Priority: optional
+          Architecture: ${ARCH}
+          Maintainer: DevOps Team <devops@example.com>
+          Installed-Size: ${INSTALLED_SIZE}
+          Depends: libc6 (>= 2.17)
+          Description: Lightweight CLI tool for a system health snapshot
+           Reads /proc and reports uptime, load average and memory info.
+          EOF
+
+          find "${ROOT}" -exec env TZ=UTC touch -h -t "${STAMP}" {} +
+
+          # -Zxz: на Ubuntu 21.10+ dpkg-deb по умолчанию жмёт zstd,
+          # а его понимают не все репозиторий-менеджеры. xz понимают все.
+          dpkg-deb -Zxz --build --root-owner-group "${ROOT}" "${DEB}"
+
+          echo "---- dpkg-deb --info ----";     dpkg-deb --info "${DEB}"
+          echo "---- dpkg-deb --contents ----"; dpkg-deb --contents "${DEB}"
+
+          # Самопроверка: версия в пакете == версия в коде
+          test "$(dpkg-deb --field "${DEB}" Version)" = "${VER}"
+          dpkg-deb --contents "${DEB}" | grep -q " ./usr/bin/${PKG}$"
+
+          SHA=$(sha256_of "${DEB}")
+          echo "SHA256: ${SHA}"
+          echo "deb_path=${DEB}" >> "$GITHUB_OUTPUT"
+          echo "deb_sha256=${SHA}" >> "$GITHUB_OUTPUT"
+
+      # ── 3. Публикация в Nexus (APT deploy) ─────────────────────────────
+      - name: "3. Publish: загрузка .deb в Nexus (APT hosted)"
+        env:
+          NEXUS_HOST: ${{ secrets.NEXUS_HOST }}
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+          DEB: ${{ steps.pack.outputs.deb_path }}
+          DEB_SHA256: ${{ steps.pack.outputs.deb_sha256 }}
+          VER: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          for s in NEXUS_HOST NEXUS_USER NEXUS_PASSWORD; do
+            [ -n "${!s}" ] || { echo "::error::Секрет ${s} не задан (Settings → Secrets and variables → Actions)"; exit 1; }
+          done
+
+          REPO_URL="http://${NEXUS_HOST}:${NEXUS_PORT}/repository/${NEXUS_REPO}"
+          PACKAGES_URL="${REPO_URL}/dists/${APT_DIST}/${APT_COMPONENT}/binary-${ARCH}/Packages"
+
+          # SHA256 пакета нужной версии, если он уже опубликован (пусто — если нет)
+          published_sha() {
+            curl -fsS "${PACKAGES_URL}" 2>/dev/null | awk -v p="${PKG}" -v v="${VER}" '
+              /^Package: / {pkg=$2} /^Version: / {ver=$2}
+              /^SHA256: /  {if (pkg==p && ver==v) print $2}
+              /^$/         {pkg=""; ver=""}' | tail -n1 || true
+          }
+
+          # Hosted APT в Nexus принимает пакет ТОЛЬКО через POST в корень репозитория.
+          # PUT (curl --upload-file) на «deep path» отвечает 405 Method Not Allowed.
+          HTTP_CODE=$(curl -sS -o /tmp/nexus-upload.out -w '%{http_code}' \
+            -u "${NEXUS_USER}:${NEXUS_PASSWORD}" \
+            -H "Content-Type: multipart/form-data" \
+            --data-binary "@${DEB}" \
+            "${REPO_URL}/") || HTTP_CODE="000"
+          echo "Nexus ответил HTTP ${HTTP_CODE}"
+
+          case "${HTTP_CODE}" in
+            2??)
+              echo "✅ ${DEB} загружен в Nexus (репозиторий '${NEXUS_REPO}')" ;;
+            401|403)
+              echo "::error::Nexus отклонил учётные данные (HTTP ${HTTP_CODE}): проверьте NEXUS_USER/NEXUS_PASSWORD и права роли"
+              exit 1 ;;
+            *)
+              # Например, Deployment policy = Disable redeploy и эта версия уже есть.
+              # Если в репозитории ровно такой же файл — повторный запуск ничего не меняет.
+              if [ "$(published_sha)" = "${DEB_SHA256}" ]; then
+                echo "::notice::${PKG} ${VER} уже опубликован с тем же SHA256 — повторная загрузка не нужна (идемпотентно)"
+              else
+                cat /tmp/nexus-upload.out 2>/dev/null; echo
+                echo "::error::Загрузка не удалась (HTTP ${HTTP_CODE}). Если версия ${VER} уже опубликована с другим содержимым — поднимите Version в main.go или включите Allow redeploy"
+                exit 1
+              fi ;;
+          esac
+
+          # Nexus сам пересобирает метаданные APT. Ждём, пока они появятся.
+          for i in $(seq 1 15); do
+            if [ "$(published_sha)" = "${DEB_SHA256}" ]; then break; fi
+            echo "Ждём индексацию Nexus... (${i}/15)"; sleep 2
+          done
+          [ "$(published_sha)" = "${DEB_SHA256}" ] || { echo "::error::Пакет не появился в индексе Packages"; exit 1; }
+
+          echo "---- dists/${APT_DIST}/Release ----"
+          curl -fsS "${REPO_URL}/dists/${APT_DIST}/Release"
+          curl -fsS -o /dev/null "${REPO_URL}/dists/${APT_DIST}/InRelease" \
+            && echo "✅ InRelease сгенерирован (метаданные подписаны ключом репозитория)"
+          echo "✅ Пакет ${PKG} ${VER} есть в индексе Packages"
+
+      # ── 4. Верификация установки через apt в чистом Ubuntu ─────────────
+      - name: "4. Verify: apt install в чистом ubuntu:22.04"
+        env:
+          NEXUS_HOST: ${{ secrets.NEXUS_HOST }}
+          VER: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Бонус: если в репозитории лежит публичный ключ — проверяем подпись (signed-by),
+          # иначе подключаем репозиторий без проверки подписи (trusted=yes).
+          if [ -f keys/syspulse-repo.asc ]; then
+            APT_OPTS="signed-by=/usr/share/keyrings/syspulse-repo.asc"
+            REPO_KEY="$(cat keys/syspulse-repo.asc)"
+            echo "🔐 Режим: signed-by (подпись InRelease проверяется)"
+          else
+            APT_OPTS="trusted=yes"
+            REPO_KEY=""
+            echo "⚠️  Режим: trusted=yes (keys/syspulse-repo.asc не найден)"
+          fi
+          export APT_OPTS REPO_KEY VER
+
+          # localhost внутри контейнера — это сам контейнер, а не машина с Nexus.
+          # host.docker.internal — имя хоста из контейнера (Docker Desktop на macOS
+          # даёт его сам, на Linux его добавляет --add-host ...:host-gateway).
+          REPO_HOST="${NEXUS_HOST}"
+          case "${NEXUS_HOST}" in
+            localhost|127.0.0.1) REPO_HOST="host.docker.internal" ;;
+          esac
+
+          # Без -it: в CI нет терминала, с -t docker падает "the input device is not a TTY".
+          # --platform linux/amd64: пакет собран под amd64. На Apple Silicon (arm64)
+          # без этого флага контейнер был бы arm64 и apt не нашёл бы пакет;
+          # с ним Docker Desktop запускает amd64-образ через эмуляцию (Rosetta/QEMU).
+          docker run --rm --platform linux/amd64 \
+            --add-host=host.docker.internal:host-gateway \
+            -e REPO_URL="http://${REPO_HOST}:${NEXUS_PORT}/repository/${NEXUS_REPO}/" \
+            -e APT_DIST -e APT_COMPONENT -e PKG -e VER -e APT_OPTS -e REPO_KEY \
+            "${VERIFY_IMAGE}" bash -euo pipefail -c '
+              if [ -n "${REPO_KEY}" ]; then
+                printf "%s\n" "${REPO_KEY}" > /usr/share/keyrings/syspulse-repo.asc
+              fi
+              echo "deb [${APT_OPTS}] ${REPO_URL} ${APT_DIST} ${APT_COMPONENT}" \
+                > /etc/apt/sources.list.d/syspulse.list
+              echo "---- sources.list.d/syspulse.list ----"
+              cat /etc/apt/sources.list.d/syspulse.list
+
+              # --error-on=any: без него apt-get update возвращает 0 даже при
+              # ошибке подписи или недоступном репозитории (только печатает W:)
+              apt-get update --error-on=any
+              apt-get install -y --no-install-recommends "${PKG}=${VER}"
+
+              echo "---- package info ----"
+              dpkg -s "${PKG}" | grep -E "^(Package|Status|Version|Architecture)"
+              apt-cache policy "${PKG}"
+
+              echo "---- container arch: $(dpkg --print-architecture) ----"
+              echo "---- run app ----"
+              OUT="$(${PKG} --version)"
+              echo "${OUT}"
+              test "${OUT}" = "${PKG} ${VER}"
+              ${PKG}
+            '
+          echo "✅ Verification passed: ${PKG} ${VER} установлен из Nexus через apt и работает"
+
+      # ── 5. Артефакт и сводка ───────────────────────────────────────────
+      - name: Save .deb as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: syspulse-deb
+          path: dist/*.deb
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Job summary
+        if: success()
+        env:
+          VER: ${{ steps.ver.outputs.version }}
+          DEB: ${{ steps.pack.outputs.deb_path }}
+          DEB_SHA256: ${{ steps.pack.outputs.deb_sha256 }}
+        run: |
+          {
+            echo "### ✅ ${PKG} ${VER} собран, опубликован и проверен"
+            echo ""
+            echo "| Шаг | Результат |"
+            echo "|---|---|"
+            echo "| Build | статический бинарник linux/amd64 |"
+            echo "| Package | \`${DEB}\` |"
+            echo "| SHA256 | \`${DEB_SHA256}\` |"
+            echo "| Publish | Nexus → \`${NEXUS_REPO}\` (${APT_DIST}/${APT_COMPONENT}) |"
+            echo "| Verify | \`apt-get install ${PKG}=${VER}\` в ${VERIFY_IMAGE} |"
+          } >> "$GITHUB_STEP_SUMMARY"
